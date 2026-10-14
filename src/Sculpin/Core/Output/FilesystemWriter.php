@@ -37,7 +37,16 @@ final class FilesystemWriter implements WriterInterface
             $this->filesystem->copy($output->file()->getRealPath(), $outputPath, true);
         } else {
             $this->filesystem->mkdir(dirname($outputPath));
-            $this->filesystem->dumpFile($outputPath, $output->formattedContent());
+
+            $content = $output->formattedContent() ?? '';
+
+            // Skip unchanged output files: for large sites this removes most
+            // of the disk write cost of a rebuild that did not change output.
+            if (is_file($outputPath) && file_get_contents($outputPath) === $content) {
+                return;
+            }
+
+            $this->filesystem->dumpFile($outputPath, $content);
         }
     }
 
