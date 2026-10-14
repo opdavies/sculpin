@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 namespace Sculpin\Core;
 
+use Sculpin\Core\Cache\SourceCache;
 use Sculpin\Core\Converter\ConverterManager;
 use Sculpin\Core\Event\SourceSetEvent;
 use Sculpin\Core\Formatter\FormatterManager;
@@ -52,11 +53,15 @@ final readonly class Sculpin
     ) {
     }
 
-    public function run(DataSourceInterface $dataSource, SourceSet $sourceSet, ?IoInterface $io = null): void
+    public function run(DataSourceInterface $dataSource, SourceSet $sourceSet, ?IoInterface $io = null, ?string $cacheDir = null): void
     {
         $io ??= new NullIo();
         $startTime = microtime(true);
         $dataSource->refresh($sourceSet);
+
+        $sourceCache = $cacheDir !== null
+            ? new SourceCache($cacheDir, fn (): string => $this->cacheGeneration())
+            : null;
 
         $found = false;
 
@@ -65,11 +70,13 @@ final readonly class Sculpin
             ->generatePhase($sourceSet, $io, $found)
             ->permalinkPhase($sourceSet)
             ->sendEvent($sourceSet, self::EVENT_AFTER_GENERATE)
-            ->convertPhase($sourceSet, $io, $found)
-            ->formatPhase($sourceSet, $io, $found)
+            ->convertPhase($sourceSet, $io, $found, $sourceCache)
+            ->formatPhase($sourceSet, $io, $found, $sourceCache)
             ->writeOutputPhase($sourceSet, $io)
             ->sendEvent($sourceSet, self::EVENT_AFTER_RUN)
         ;
+
+        $sourceCache?->persist();
 
         if ($found) {
             $io->write(
@@ -153,7 +160,7 @@ final readonly class Sculpin
      * @param bool $found
      * @return Sculpin
      */
-    protected function convertPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found): self
+    protected function convertPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found, ?SourceCache $sourceCache = null): self
     {
         $updatedSources = $sourceSet->updatedSources();
 
@@ -173,15 +180,53 @@ final readonly class Sculpin
         $counter = 0;
         $timer = microtime(true);
 
-        foreach ($updatedSources as $source) {
-            $this->converterManager->convertSource($source);
+        $convert = function (SourceInterface $source) use ($io, &$counter, $total, $sourceCache): array {
+            $key = $sourceCache?->keyFor($source, $source->content());
 
-            if ($source->canBeFormatted()) {
-                $source->data()->set('blocks', $this->formatterManager->formatSourceBlocks($source));
+            $cached = $key !== null ? $sourceCache->blocks($source->sourceId(), $key) : null;
+
+            if ($cached !== null) {
+                return $cached;
             }
 
+            $rawContent = $source->content();
+            $this->converterManager->convertSource($source);
+
+            $blocks = $source->canBeFormatted()
+                ? $this->formatterManager->formatSourceBlocks($source)
+                : null;
+
+            // Store converted content only when a converter changed it; a
+            // null content means the raw content is still authoritative, so
+            // static assets keep their useFileReference behaviour.
+            $sourceCache?->rememberBlocks(
+                $source->sourceId(),
+                $key,
+                $source->content() !== $rawContent ? $source->content() : null,
+                $blocks,
+            );
+
+            $result = [];
+
+            // Only hand back content when a converter changed it, so static
+            // assets keep their useFileReference behaviour untouched.
+            if ($source->content() !== $rawContent) {
+                $result['content'] = $source->content();
+            }
+
+            $result['blocks'] = $blocks;
+
+            return $result;
+        };
+
+        $results = [];
+
+        foreach ($updatedSources as $source) {
+            $results[$source->sourceId()] = ['sourceId' => $source->sourceId()] + $convert($source);
             $io->overwrite(sprintf('%3d%%', 100 * ((++$counter) / $total)), false);
         }
+
+        $this->applyResults($sourceSet, $results, 'blocks');
 
         $io->write(sprintf(' (%d sources / %4.2f seconds)', $total, microtime(true) - $timer));
 
@@ -196,7 +241,7 @@ final readonly class Sculpin
      * @param bool $found
      * @return Sculpin
      */
-    protected function formatPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found): self
+    protected function formatPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found, ?SourceCache $sourceCache = null): self
     {
         $updatedSources = $sourceSet->updatedSources();
 
@@ -216,10 +261,21 @@ final readonly class Sculpin
         $counter = 0;
         $timer = microtime(true);
 
+        $formattedResults = [];
+
         foreach ($updatedSources as $source) {
-            $source->canBeFormatted()
-                ? $source->setFormattedContent($this->formatterManager->formatSourcePage($source))
-                : $source->setFormattedContent($source->content());
+            $key = $sourceCache?->keyFor($source, $source->content());
+
+            if ($key !== null && ($formatted = $sourceCache->formatted($source->sourceId(), $key)) !== false) {
+                $source->setFormattedContent($formatted);
+            } else {
+                $formatted = $source->canBeFormatted()
+                    ? $this->formatterManager->formatSourcePage($source)
+                    : $source->content();
+
+                $sourceCache?->rememberFormatted($source->sourceId(), $key, $formatted);
+                $source->setFormattedContent($formatted);
+            }
 
             $io->overwrite(sprintf('%3d%%', 100 * ((++$counter) / $total)), false);
         }
@@ -228,6 +284,93 @@ final readonly class Sculpin
         $io->write(sprintf(' (%d sources / %4.2f seconds)', $total, microtime(true) - $timer));
 
         return $this;
+    }
+
+    /**
+     * Apply per-source results (from workers or cache) back onto the source
+     * set, keyed by source ID.
+     *
+     * @param array<string, array<string, mixed>> $results
+     */
+    private function applyResults(SourceSet $sourceSet, array $results, string $mode): void
+    {
+        $sources = [];
+
+        foreach ($sourceSet->updatedSources() as $source) {
+            $sources[$source->sourceId()] = $source;
+        }
+
+        foreach ($results as $result) {
+            $source = $sources[$result['sourceId']] ?? null;
+
+            if (!$source instanceof SourceInterface) {
+                continue;
+            }
+
+            if ($mode === 'blocks') {
+                if (isset($result['content'])) {
+                    $source->setContent($result['content']);
+                }
+
+                if ($result['blocks'] !== null) {
+                    $source->data()->set('blocks', $result['blocks']);
+                }
+            }
+        }
+    }
+
+    /**
+     * A token covering everything shared between sources: site configuration,
+     * Twig template files, and the data provider collections.
+     */
+    private function cacheGeneration(): string
+    {
+        $stats = [];
+
+        $formatter = $this->formatterManager->formatter($this->formatterManager->defaultFormatter());
+
+        $twig = $formatter instanceof \Sculpin\Bundle\TwigBundle\TwigFormatter ? $formatter->twig() : null;
+
+        if ($twig !== null && $twig->getLoader() instanceof \Twig\Loader\FilesystemLoader) {
+            foreach ($twig->getLoader()->getPaths() as $path) {
+                $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS));
+
+                foreach ($it as $file) {
+                    /** @var \SplFileInfo $file */
+                    if (str_ends_with((string) $file->getPathname(), '.twig')) {
+                        $stats[] = [$file->getPathname(), $file->getMTime(), $file->getSize()];
+                    }
+                }
+            }
+        }
+
+        $providers = [];
+
+        if ($this->formatterManager->dataProviderManager() !== null) {
+            $dataProviderManager = $this->formatterManager->dataProviderManager();
+
+            foreach ($dataProviderManager->dataProviders() as $name) {
+                foreach ($dataProviderManager->dataProvider($name)->provideData() as $index => $item) {
+                    $fingerprint = [$name, $index];
+
+                    if ($item instanceof SourceInterface) {
+                        $fingerprint[] = $item->sourceId();
+                        $fingerprint[] = md5(SourceCache::canonicalize($item->data()->export()));
+                        $fingerprint[] = md5((string) $item->content());
+                    } else {
+                        $fingerprint[] = md5(SourceCache::canonicalize($item));
+                    }
+
+                    $providers[] = $fingerprint;
+                }
+            }
+        }
+
+        return hash('sha256', serialize([
+            SourceCache::canonicalize($this->formatterManager->siteConfiguration()->export()),
+            $stats,
+            $providers,
+        ]));
     }
 
     /**

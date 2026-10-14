@@ -82,6 +82,12 @@ class GenerateCommand extends AbstractCommand
                 new InputOption('port', null, InputOption::VALUE_REQUIRED, 'Port'),
                 new InputOption('output-dir', null, InputOption::VALUE_REQUIRED, 'Output Directory'),
                 new InputOption('source-dir', null, InputOption::VALUE_REQUIRED, 'Source Directory'),
+                new InputOption(
+                    'cache-dir',
+                    null,
+                    InputOption::VALUE_REQUIRED,
+                    'Directory for the persistent per-source cache. Reuses converted and formatted output when sources, templates and configuration are unchanged.'
+                ),
             ])
             ->setHelp(<<<EOT
             The <info>generate</info> command generates a site.
@@ -127,7 +133,7 @@ class GenerateCommand extends AbstractCommand
         if ($input->getOption('server')) {
             $this->throwExceptions = false;
             $output->isDebug();
-            $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo);
+            $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo, $input->getOption('cache-dir'));
 
             if ($input->getOption('editor')) {
                 $fetcher = new InBrowserEditorContentFetcher(
@@ -174,7 +180,7 @@ class GenerateCommand extends AbstractCommand
 
             $this->throwExceptions = !$watch;
             do {
-                $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo);
+                $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo, $input->getOption('cache-dir'));
 
                 if ($watch) {
                     sleep(2);
@@ -223,7 +229,8 @@ class GenerateCommand extends AbstractCommand
         Sculpin $sculpin,
         DataSourceInterface $dataSource,
         SourceSet $sourceSet,
-        IoInterface $io
+        IoInterface $io,
+        ?string $cacheDir = null
     ): void {
         $messages = [];
         $errPrint = fn(\Throwable $e) => $e->getMessage()
@@ -232,7 +239,7 @@ class GenerateCommand extends AbstractCommand
             . str_replace(getcwd() . DIRECTORY_SEPARATOR, '', $e->getFile());
 
         try {
-            $sculpin->run($dataSource, $sourceSet, $io);
+            $sculpin->run($dataSource, $sourceSet, $io, $cacheDir);
 
             return;
         } catch (LoaderError | RuntimeError | SyntaxError $e) {

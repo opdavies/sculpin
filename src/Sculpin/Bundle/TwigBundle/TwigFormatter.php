@@ -31,6 +31,11 @@ final readonly class TwigFormatter implements FormatterInterface
     {
     }
 
+    public function twig(): Environment
+    {
+        return $this->twig;
+    }
+
     /**
      * {@inheritdoc}
      *
