@@ -42,6 +42,12 @@ final readonly class Sculpin
     public const string EVENT_BEFORE_FORMAT = 'sculpin.core.before_format';
     public const string EVENT_AFTER_FORMAT = 'sculpin.core.after_format';
 
+    /**
+     * Sources below this count are always processed serially; the fork
+     * overhead would outweigh the parallelism.
+     */
+    private const int PARALLEL_MINIMUM_SOURCES = 64;
+
     public function __construct(
         private EventDispatcherInterface $eventDispatcher,
         private SourcePermalinkFactoryInterface $permalinkFactory,
@@ -52,7 +58,7 @@ final readonly class Sculpin
     ) {
     }
 
-    public function run(DataSourceInterface $dataSource, SourceSet $sourceSet, ?IoInterface $io = null): void
+    public function run(DataSourceInterface $dataSource, SourceSet $sourceSet, ?IoInterface $io = null, ?int $jobs = null): void
     {
         $io ??= new NullIo();
         $startTime = microtime(true);
@@ -65,8 +71,8 @@ final readonly class Sculpin
             ->generatePhase($sourceSet, $io, $found)
             ->permalinkPhase($sourceSet)
             ->sendEvent($sourceSet, self::EVENT_AFTER_GENERATE)
-            ->convertPhase($sourceSet, $io, $found)
-            ->formatPhase($sourceSet, $io, $found)
+            ->convertPhase($sourceSet, $io, $found, $jobs)
+            ->formatPhase($sourceSet, $io, $found, $jobs)
             ->writeOutputPhase($sourceSet, $io)
             ->sendEvent($sourceSet, self::EVENT_AFTER_RUN)
         ;
@@ -94,8 +100,8 @@ final readonly class Sculpin
     }
 
     /**
-     * @param SourceSet $sourceSet The list of all sources
-     * @param NullIo|IoInterface|null $io Helper for writing/overwriting console output
+     * @param SourceSet $sourceSet
+     * @param NullIo|IoInterface|null $io
      * @param bool $found
      * @return Sculpin
      */
@@ -131,7 +137,7 @@ final readonly class Sculpin
     }
 
     /**
-     * @param SourceSet $sourceSet      The list of all sources
+     * @param SourceSet $sourceSet
      * @return Sculpin
      */
     protected function permalinkPhase(SourceSet $sourceSet): self
@@ -151,9 +157,10 @@ final readonly class Sculpin
      * @param SourceSet $sourceSet
      * @param NullIo|IoInterface|null $io
      * @param bool $found
+     * @param int|null $jobs
      * @return Sculpin
      */
-    protected function convertPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found): self
+    protected function convertPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found, ?int $jobs): self
     {
         $updatedSources = $sourceSet->updatedSources();
 
@@ -170,18 +177,30 @@ final readonly class Sculpin
 
         $io->write('Converting: ', false);
         $io->write('', false);
-        $counter = 0;
         $timer = microtime(true);
 
-        foreach ($updatedSources as $source) {
+        // Only hand back content when a converter changed it; static assets
+        // keep their useFileReference behaviour untouched.
+        $convert = function (SourceInterface $source): array {
+            $originalContent = $source->content();
+
             $this->converterManager->convertSource($source);
 
-            if ($source->canBeFormatted()) {
-                $source->data()->set('blocks', $this->formatterManager->formatSourceBlocks($source));
+            $result = [];
+
+            if ($source->content() !== $originalContent) {
+                $result['content'] = $source->content();
             }
 
-            $io->overwrite(sprintf('%3d%%', 100 * ((++$counter) / $total)), false);
-        }
+            if ($source->canBeFormatted()) {
+                $result['blocks'] = $this->formatterManager->formatSourceBlocks($source);
+            }
+
+            return $result;
+        };
+
+        $results = $this->forEachSource($sourceSet, $convert, $io, $total, $jobs);
+        $this->applyResults($sourceSet, $results, 'blocks');
 
         $io->write(sprintf(' (%d sources / %4.2f seconds)', $total, microtime(true) - $timer));
 
@@ -194,9 +213,10 @@ final readonly class Sculpin
      * @param SourceSet $sourceSet
      * @param NullIo|IoInterface|null $io
      * @param bool $found
+     * @param int|null $jobs
      * @return Sculpin
      */
-    protected function formatPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found): self
+    protected function formatPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found, ?int $jobs): self
     {
         $updatedSources = $sourceSet->updatedSources();
 
@@ -213,21 +233,243 @@ final readonly class Sculpin
 
         $io->write('Formatting: ', false);
         $io->write('', false);
-        $counter = 0;
         $timer = microtime(true);
 
-        foreach ($updatedSources as $source) {
-            $source->canBeFormatted()
-                ? $source->setFormattedContent($this->formatterManager->formatSourcePage($source))
-                : $source->setFormattedContent($source->content());
+        $format = function (SourceInterface $source): array {
+            return [
+                'formatted' => $source->canBeFormatted()
+                    ? $this->formatterManager->formatSourcePage($source)
+                    : $source->content(),
+            ];
+        };
 
-            $io->overwrite(sprintf('%3d%%', 100 * ((++$counter) / $total)), false);
-        }
+        $results = $this->forEachSource($sourceSet, $format, $io, $total, $jobs);
+        $this->applyResults($sourceSet, $results, 'formatted');
 
         $this->eventDispatcher->dispatch(new SourceSetEvent($sourceSet), self::EVENT_AFTER_FORMAT);
         $io->write(sprintf(' (%d sources / %4.2f seconds)', $total, microtime(true) - $timer));
 
         return $this;
+    }
+
+    /**
+     * Apply per-source results back onto the source set, keyed by source ID.
+     *
+     * @param array<string, array<string, mixed>> $results
+     */
+    private function applyResults(SourceSet $sourceSet, array $results, string $mode): void
+    {
+        $sources = [];
+
+        foreach ($sourceSet->updatedSources() as $source) {
+            $sources[$source->sourceId()] = $source;
+        }
+
+        foreach ($results as $result) {
+            $source = $sources[$result['sourceId']] ?? null;
+
+            if (!$source instanceof SourceInterface) {
+                continue;
+            }
+
+            if (array_key_exists('content', $result)) {
+                $source->setContent($result['content']);
+            }
+
+            if ($mode === 'blocks' && array_key_exists('blocks', $result) && $result['blocks'] !== null) {
+                $source->data()->set('blocks', $result['blocks']);
+            }
+
+            if ($mode === 'formatted' && array_key_exists('formatted', $result)) {
+                $source->setFormattedContent($result['formatted']);
+            }
+        }
+    }
+
+    /**
+     * Process every updated source with the given per-source callable,
+     * optionally across worker processes.
+     *
+     * Workers receive copies of the in-memory source set (copy on write) and
+     * return their per-source results, so any state that would normally be
+     * mutated on the source must be included in the result. This means event
+     * listeners that mutate sources during convert events are not reflected
+     * in parallel mode.
+     */
+    private function forEachSource(SourceSet $sourceSet, callable $worker, NullIo|IoInterface|null $io, int $total, ?int $jobs): array
+    {
+        $sources = array_values($sourceSet->updatedSources());
+
+        if (($jobs ?? 1) <= 1 || count($sources) < self::PARALLEL_MINIMUM_SOURCES) {
+            $results = [];
+
+            foreach ($sources as $source) {
+                $results[$source->sourceId()] = ['sourceId' => $source->sourceId()] + $worker($source);
+            }
+
+            return $results;
+        }
+
+        return $this->forEachSourceInWorkers($sources, $worker, $io, $total, (int) $jobs);
+    }
+
+    /**
+     * @param list<SourceInterface> $sources
+     */
+    private function forEachSourceInWorkers(array $sources, callable $worker, NullIo|IoInterface|null $io, int $total, int $jobs): array
+    {
+        $chunks = array_chunk($sources, max(1, (int) ceil(count($sources) / $jobs)));
+
+        // Fork all workers first so they run concurrently, then collect.
+        $workers = [];
+
+        foreach (array_keys($chunks) as $index) {
+            $workers[$index] = $this->spawnWorker($chunks[$index], $worker);
+        }
+
+        $results = [];
+
+        foreach ($workers as $index => $worker) {
+            $results += $this->collectWorker($worker['pid'], $worker['stream']);
+        }
+
+        $this->reapWorkers();
+
+        return $results;
+    }
+
+    /**
+     * Spawn a worker for the given chunk of sources and return its process
+     * ID and the parent-side stream.
+     *
+     * @param list<SourceInterface> $chunk
+     * @return array{pid: int, stream: resource}
+     */
+    private function spawnWorker(array $chunk, callable $worker): array
+    {
+        if (!function_exists('pcntl_fork') || !function_exists('posix_kill')) {
+            throw new \RuntimeException(
+                'Parallel processing requires the pcntl and posix extensions.'
+            );
+        }
+
+        $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+
+        if ($pair === false) {
+            throw new \RuntimeException('Unable to create stream pair for parallel processing.');
+        }
+
+        [$parentRead, $childWrite] = $pair;
+
+        $pid = pcntl_fork();
+
+        if ($pid === -1) {
+            fclose($parentRead);
+            fclose($childWrite);
+            throw new \RuntimeException('Unable to fork for parallel processing.');
+        }
+
+        if ($pid === 0) {
+            // Child: process the chunk and stream the results to the parent.
+            fclose($parentRead);
+            $results = [];
+            $failed = false;
+
+            try {
+                foreach ($chunk as $source) {
+                    $results[$source->sourceId()] = ['sourceId' => $source->sourceId()] + $worker($source);
+                }
+            } catch (\Throwable) {
+                $failed = true;
+            }
+
+            if (!$failed) {
+                $payload = serialize($results);
+
+                fwrite($childWrite, pack('J', strlen($payload)));
+
+                $offset = 0;
+
+                while ($offset < strlen($payload)) {
+                    $written = fwrite($childWrite, substr($payload, $offset));
+
+                    if ($written === false || $written === 0) {
+                        $failed = true;
+
+                        break;
+                    }
+
+                    $offset += $written;
+                }
+            }
+
+            fclose($childWrite);
+            posix_kill(posix_getpid(), SIGKILL);
+        }
+
+        // Parent side.
+        fclose($childWrite);
+
+        return ['pid' => $pid, 'stream' => $parentRead];
+    }
+
+    /**
+     * Read a worker's results and verify the worker exited cleanly.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    private function collectWorker(int $pid, $stream): array
+    {
+        $size = self::readExactly($stream, 8);
+        $payload = self::readExactly($stream, unpack('J', $size)[1]);
+        fclose($stream);
+
+        pcntl_waitpid($pid, $status);
+
+        if (!pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
+            // Workers kill themselves with SIGKILL once their payload is
+            // handed over, which shows up as a non-zero exit.
+            if (!pcntl_wifsignaled($status) || pcntl_wtermsig($status) !== SIGKILL) {
+                throw new \RuntimeException('A parallel worker failed unexpectedly.');
+            }
+        }
+
+        /** @var array<string, array<string, mixed>>|false $results */
+        $results = unserialize($payload);
+
+        if (!is_array($results)) {
+            throw new \RuntimeException('Worker returned an unexpected result payload.');
+        }
+
+        return $results;
+    }
+
+    private static function readExactly($socket, int $length): string
+    {
+        $buffer = '';
+
+        while (strlen($buffer) < $length) {
+            $data = fread($socket, min(65536, $length - strlen($buffer)));
+
+            if ($data === false || $data === '') {
+                throw new \RuntimeException('Worker terminated without returning results.');
+            }
+
+            $buffer .= $data;
+        }
+
+        return $buffer;
+    }
+
+    /**
+     * Workers kill themselves with SIGKILL after handing over their results;
+     * every child must be reaped so no zombies are left behind.
+     */
+    private function reapWorkers(): void
+    {
+        while (pcntl_waitpid(-1, $status) > 0) {
+            // Collect workers until no children remain.
+        }
     }
 
     /**

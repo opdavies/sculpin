@@ -82,6 +82,13 @@ class GenerateCommand extends AbstractCommand
                 new InputOption('port', null, InputOption::VALUE_REQUIRED, 'Port'),
                 new InputOption('output-dir', null, InputOption::VALUE_REQUIRED, 'Output Directory'),
                 new InputOption('source-dir', null, InputOption::VALUE_REQUIRED, 'Source Directory'),
+                new InputOption(
+                    'jobs',
+                    null,
+                    InputOption::VALUE_REQUIRED,
+                    'Number of parallel workers for the convert and format phases.',
+                    '1'
+                ),
             ])
             ->setHelp(<<<EOT
             The <info>generate</info> command generates a site.
@@ -173,8 +180,17 @@ class GenerateCommand extends AbstractCommand
             }
 
             $this->throwExceptions = !$watch;
+            $jobsOption = $input->getOption('jobs');
+            $jobs = $jobsOption === null || $jobsOption === '' ? 1 : max(1, (int) $jobsOption);
+
+            if ($jobsOption === '0') {
+                // A jobs value of 0 means one worker per available CPU.
+                $cores = trim((string) shell_exec('nproc 2>/dev/null'));
+                $jobs = max(1, (int) $cores);
+            }
+
             do {
-                $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo);
+                $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo, $jobs);
 
                 if ($watch) {
                     sleep(2);
@@ -223,7 +239,8 @@ class GenerateCommand extends AbstractCommand
         Sculpin $sculpin,
         DataSourceInterface $dataSource,
         SourceSet $sourceSet,
-        IoInterface $io
+        IoInterface $io,
+        int $jobs = 1
     ): void {
         $messages = [];
         $errPrint = fn(\Throwable $e) => $e->getMessage()
@@ -232,7 +249,7 @@ class GenerateCommand extends AbstractCommand
             . str_replace(getcwd() . DIRECTORY_SEPARATOR, '', $e->getFile());
 
         try {
-            $sculpin->run($dataSource, $sourceSet, $io);
+            $sculpin->run($dataSource, $sourceSet, $io, $jobs);
 
             return;
         } catch (LoaderError | RuntimeError | SyntaxError $e) {
