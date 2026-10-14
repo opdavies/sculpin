@@ -13,6 +13,7 @@ declare(strict_types=1);
 
 namespace Sculpin\Core;
 
+use Sculpin\Core\Cache\SourceCache;
 use Sculpin\Core\Converter\ConverterManager;
 use Sculpin\Core\Event\SourceSetEvent;
 use Sculpin\Core\Formatter\FormatterManager;
@@ -58,11 +59,15 @@ final readonly class Sculpin
     ) {
     }
 
-    public function run(DataSourceInterface $dataSource, SourceSet $sourceSet, ?IoInterface $io = null, ?int $jobs = null): void
+    public function run(DataSourceInterface $dataSource, SourceSet $sourceSet, ?IoInterface $io = null, ?int $jobs = null, ?string $cacheDir = null): void
     {
         $io ??= new NullIo();
         $startTime = microtime(true);
         $dataSource->refresh($sourceSet);
+
+        $sourceCache = $cacheDir !== null
+            ? new SourceCache($cacheDir, fn (): string => $this->cacheGeneration())
+            : null;
 
         $found = false;
 
@@ -71,11 +76,13 @@ final readonly class Sculpin
             ->generatePhase($sourceSet, $io, $found)
             ->permalinkPhase($sourceSet)
             ->sendEvent($sourceSet, self::EVENT_AFTER_GENERATE)
-            ->convertPhase($sourceSet, $io, $found, $jobs)
-            ->formatPhase($sourceSet, $io, $found, $jobs)
+            ->convertPhase($sourceSet, $io, $found, $jobs, $sourceCache)
+            ->formatPhase($sourceSet, $io, $found, $jobs, $sourceCache)
             ->writeOutputPhase($sourceSet, $io)
             ->sendEvent($sourceSet, self::EVENT_AFTER_RUN)
         ;
+
+        $sourceCache?->persist();
 
         if ($found) {
             $io->write(
@@ -160,7 +167,7 @@ final readonly class Sculpin
      * @param int|null $jobs
      * @return Sculpin
      */
-    protected function convertPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found, ?int $jobs): self
+    protected function convertPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found, ?int $jobs, ?SourceCache $sourceCache = null): self
     {
         $updatedSources = $sourceSet->updatedSources();
 
@@ -179,9 +186,24 @@ final readonly class Sculpin
         $io->write('', false);
         $timer = microtime(true);
 
-        // Only hand back content when a converter changed it; static assets
-        // keep their useFileReference behaviour untouched.
-        $convert = function (SourceInterface $source): array {
+        // Load the previous run's entries in the parent process so that
+        // workers inherit them through copy-on-write.
+        $sourceCache?->generation();
+
+        // Cached blocks reuse a previous run's converted content and block
+        // rendering. Only hand back content when a converter changed it, so
+        // static assets keep their useFileReference behaviour untouched.
+        // Misses carry their cache key back so the parent can remember them:
+        // worker processes cannot persist cache state.
+        $convert = function (SourceInterface $source) use ($sourceCache): array {
+            $key = $sourceCache?->keyFor($source, $source->content());
+
+            $cached = $key !== null ? $sourceCache->blocks($source->sourceId(), $key) : null;
+
+            if (is_array($cached)) {
+                return $cached;
+            }
+
             $originalContent = $source->content();
 
             $this->converterManager->convertSource($source);
@@ -196,11 +218,29 @@ final readonly class Sculpin
                 $result['blocks'] = $this->formatterManager->formatSourceBlocks($source);
             }
 
+            if ($key !== null) {
+                $result['cacheKey'] = $key;
+            }
+
             return $result;
         };
 
         $results = $this->forEachSource($sourceSet, $convert, $io, $total, $jobs);
         $this->applyResults($sourceSet, $results, 'blocks');
+
+        // Workers cannot persist cache state, so misses are remembered here.
+        if ($sourceCache !== null) {
+            foreach ($results as $result) {
+                if (isset($result['cacheKey'])) {
+                    $sourceCache->rememberBlocks(
+                        $result['sourceId'],
+                        $result['cacheKey'],
+                        $result['content'] ?? null,
+                        $result['blocks'] ?? null,
+                    );
+                }
+            }
+        }
 
         $io->write(sprintf(' (%d sources / %4.2f seconds)', $total, microtime(true) - $timer));
 
@@ -216,7 +256,7 @@ final readonly class Sculpin
      * @param int|null $jobs
      * @return Sculpin
      */
-    protected function formatPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found, ?int $jobs): self
+    protected function formatPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io, bool &$found, ?int $jobs, ?SourceCache $sourceCache = null): self
     {
         $updatedSources = $sourceSet->updatedSources();
 
@@ -235,16 +275,42 @@ final readonly class Sculpin
         $io->write('', false);
         $timer = microtime(true);
 
-        $format = function (SourceInterface $source): array {
-            return [
-                'formatted' => $source->canBeFormatted()
-                    ? $this->formatterManager->formatSourcePage($source)
-                    : $source->content(),
-            ];
+        $sourceCache?->generation();
+
+        $format = function (SourceInterface $source) use ($sourceCache): array {
+            $key = $sourceCache?->keyFor($source, $source->content());
+
+            if ($key !== null) {
+                $cached = $sourceCache->formatted($source->sourceId(), $key);
+
+                if ($cached !== false) {
+                    return ['formatted' => $cached];
+                }
+            }
+
+            $formatted = $source->canBeFormatted()
+                ? $this->formatterManager->formatSourcePage($source)
+                : $source->content();
+
+            $result = ['formatted' => $formatted];
+
+            if ($key !== null) {
+                $result['cacheKey'] = $key;
+            }
+
+            return $result;
         };
 
         $results = $this->forEachSource($sourceSet, $format, $io, $total, $jobs);
         $this->applyResults($sourceSet, $results, 'formatted');
+
+        if ($sourceCache !== null) {
+            foreach ($results as $result) {
+                if (isset($result['cacheKey'])) {
+                    $sourceCache->rememberFormatted($result['sourceId'], $result['cacheKey'], $result['formatted']);
+                }
+            }
+        }
 
         $this->eventDispatcher->dispatch(new SourceSetEvent($sourceSet), self::EVENT_AFTER_FORMAT);
         $io->write(sprintf(' (%d sources / %4.2f seconds)', $total, microtime(true) - $timer));
@@ -272,7 +338,7 @@ final readonly class Sculpin
                 continue;
             }
 
-            if (array_key_exists('content', $result)) {
+            if (isset($result['content'])) {
                 $source->setContent($result['content']);
             }
 
@@ -477,6 +543,58 @@ final readonly class Sculpin
      * @param NullIo|IoInterface|null $io
      * @return Sculpin
      */
+    /**
+     * A token covering everything shared between sources: site configuration,
+     * Twig template files, and the data provider collections.
+     */
+    private function cacheGeneration(): string
+    {
+        $stats = [];
+
+        $formatter = $this->formatterManager->formatter($this->formatterManager->defaultFormatter());
+
+        $twig = $formatter instanceof \Sculpin\Bundle\TwigBundle\TwigFormatter ? $formatter->twig() : null;
+
+        if ($twig !== null && $twig->getLoader() instanceof \Twig\Loader\FilesystemLoader) {
+            foreach ($twig->getLoader()->getPaths() as $path) {
+                $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($path, \FilesystemIterator::SKIP_DOTS));
+
+                foreach ($it as $file) {
+                    /** @var \SplFileInfo $file */
+                    if (str_ends_with((string) $file->getPathname(), '.twig')) {
+                        $stats[] = [$file->getPathname(), $file->getMTime(), $file->getSize()];
+                    }
+                }
+            }
+        }
+
+        $providers = [];
+
+        if ($this->formatterManager->dataProviderManager() !== null) {
+            foreach ($this->formatterManager->dataProviderManager()->dataProviders() as $name) {
+                foreach ($this->formatterManager->dataProviderManager()->dataProvider($name)->provideData() as $index => $item) {
+                    $fingerprint = [$name, $index];
+
+                    if ($item instanceof SourceInterface) {
+                        $fingerprint[] = $item->sourceId();
+                        $fingerprint[] = md5(SourceCache::canonicalize($item->data()->export()));
+                        $fingerprint[] = md5((string) $item->content());
+                    } else {
+                        $fingerprint[] = md5(SourceCache::canonicalize($item));
+                    }
+
+                    $providers[] = $fingerprint;
+                }
+            }
+        }
+
+        return hash('sha256', serialize([
+            SourceCache::canonicalize($this->formatterManager->siteConfiguration()->export()),
+            $stats,
+            $providers,
+        ]));
+    }
+
     protected function writeOutputPhase(SourceSet $sourceSet, NullIo|IoInterface|null $io): self
     {
         foreach ($sourceSet->updatedSources() as $source) {

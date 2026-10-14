@@ -89,6 +89,12 @@ class GenerateCommand extends AbstractCommand
                     'Number of parallel workers for the convert and format phases.',
                     '1'
                 ),
+                new InputOption(
+                    'cache-dir',
+                    null,
+                    InputOption::VALUE_REQUIRED,
+                    'Directory for the persistent per-source cache. Reuses converted and formatted output when sources, templates and configuration are unchanged.'
+                ),
             ])
             ->setHelp(<<<EOT
             The <info>generate</info> command generates a site.
@@ -131,10 +137,21 @@ class GenerateCommand extends AbstractCommand
 
         $consoleIo = new ConsoleIo($input, $output);
 
+        $jobsOption = $input->getOption('jobs');
+        $jobs = $jobsOption === null || $jobsOption === '' ? 1 : max(1, (int) $jobsOption);
+
+        if ($jobsOption === '0') {
+            // A jobs value of 0 means one worker per available CPU.
+            $cores = trim((string) shell_exec('nproc 2>/dev/null'));
+            $jobs = max(1, (int) $cores);
+        }
+
+        $cacheDir = $input->getOption('cache-dir');
+
         if ($input->getOption('server')) {
             $this->throwExceptions = false;
             $output->isDebug();
-            $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo);
+            $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo, $jobs, $cacheDir);
 
             if ($input->getOption('editor')) {
                 $fetcher = new InBrowserEditorContentFetcher(
@@ -161,11 +178,11 @@ class GenerateCommand extends AbstractCommand
             if ($watch) {
                 Loop::addPeriodicTimer(
                     1,
-                    function () use ($sculpin, $dataSource, $sourceSet, $fetcher, $consoleIo): void {
+                    function () use ($sculpin, $dataSource, $sourceSet, $fetcher, $consoleIo, $jobs, $cacheDir): void {
                         clearstatcache();
                         $sourceSet->reset();
                         $fetcher->buildPathMap($sourceSet);
-                        $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo);
+                        $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo, $jobs, $cacheDir);
                     }
                 );
             }
@@ -190,7 +207,7 @@ class GenerateCommand extends AbstractCommand
             }
 
             do {
-                $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo, $jobs);
+                $this->runSculpin($sculpin, $dataSource, $sourceSet, $consoleIo, $jobs, $cacheDir);
 
                 if ($watch) {
                     sleep(2);
@@ -240,7 +257,8 @@ class GenerateCommand extends AbstractCommand
         DataSourceInterface $dataSource,
         SourceSet $sourceSet,
         IoInterface $io,
-        int $jobs = 1
+        int $jobs = 1,
+        ?string $cacheDir = null
     ): void {
         $messages = [];
         $errPrint = fn(\Throwable $e) => $e->getMessage()
@@ -249,7 +267,7 @@ class GenerateCommand extends AbstractCommand
             . str_replace(getcwd() . DIRECTORY_SEPARATOR, '', $e->getFile());
 
         try {
-            $sculpin->run($dataSource, $sourceSet, $io, $jobs);
+            $sculpin->run($dataSource, $sourceSet, $io, $jobs, $cacheDir);
 
             return;
         } catch (LoaderError | RuntimeError | SyntaxError $e) {

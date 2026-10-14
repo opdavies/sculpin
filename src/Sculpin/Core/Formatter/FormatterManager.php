@@ -147,4 +147,14 @@ class FormatterManager
     {
         $this->dataProviderManager = $dataProviderManager;
     }
+
+    public function dataProviderManager(): ?DataProviderManager
+    {
+        return $this->dataProviderManager;
+    }
+
+    public function siteConfiguration(): Configuration
+    {
+        return $this->siteConfiguration;
+    }
 }
