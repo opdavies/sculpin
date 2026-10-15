@@ -302,9 +302,12 @@ final readonly class Sculpin
 
         if (($jobs ?? 1) <= 1 || count($sources) < self::PARALLEL_MINIMUM_SOURCES) {
             $results = [];
+            $counter = 0;
 
             foreach ($sources as $source) {
                 $results[$source->sourceId()] = ['sourceId' => $source->sourceId()] + $worker($source);
+
+                $io->overwrite(sprintf('%3d%%', (int) (100 * ((++$counter) / $total))), false);
             }
 
             return $results;
@@ -328,9 +331,14 @@ final readonly class Sculpin
         }
 
         $results = [];
+        $collected = 0;
 
         foreach ($workers as $index => $worker) {
             $results += $this->collectWorker($worker['pid'], $worker['stream']);
+
+            $collected += count($chunks[$index]);
+
+            $io->overwrite(sprintf('%3d%%', (int) (100 * ($collected / $total))), false);
         }
 
         $this->reapWorkers();
