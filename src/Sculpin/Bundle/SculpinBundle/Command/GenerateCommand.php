@@ -20,6 +20,7 @@ use Sculpin\Bundle\SculpinBundle\HttpServer\HttpServer;
 use Sculpin\Bundle\EditorBundle\InBrowserEditorContentFetcher;
 use Sculpin\Core\Io\ConsoleIo;
 use Sculpin\Core\Io\IoInterface;
+use Sculpin\Core\Output\HtmlMinifier;
 use Sculpin\Core\Sculpin;
 use Sculpin\Core\Source\DataSourceInterface;
 use Sculpin\Core\Source\SourceSet;
@@ -82,6 +83,12 @@ class GenerateCommand extends AbstractCommand
                 new InputOption('port', null, InputOption::VALUE_REQUIRED, 'Port'),
                 new InputOption('output-dir', null, InputOption::VALUE_REQUIRED, 'Output Directory'),
                 new InputOption('source-dir', null, InputOption::VALUE_REQUIRED, 'Source Directory'),
+                new InputOption(
+                    'minify',
+                    null,
+                    InputOption::VALUE_NONE,
+                    'Minifies the generated HTML after a single-run generation.'
+                ),
                 new InputOption(
                     'jobs',
                     null,
@@ -215,9 +222,58 @@ class GenerateCommand extends AbstractCommand
                     $sourceSet->reset();
                 }
             } while ($watch);
+
+            if (!$watch && $input->getOption('minify')) {
+                $this->minifyOutput($docroot, $consoleIo);
+            }
         }
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * Minify the generated HTML documents in the output directory.
+     *
+     * @param string $dir The directory to minify
+     */
+    private function minifyOutput(string $dir, ConsoleIo $io): void
+    {
+        if (!is_dir($dir)) {
+            return;
+        }
+
+        $count = 0;
+        $bytes = 0;
+        $minifier = new HtmlMinifier();
+
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS)
+        );
+
+        /** @var \SplFileInfo $file */
+        foreach ($iterator as $file) {
+            if (!$file->isFile() || strtolower($file->getExtension()) !== 'html') {
+                continue;
+            }
+
+            $path = (string) $file->getPathname();
+            $original = (string) file_get_contents($path);
+            $minified = $minifier->minify($original);
+
+            if ($minified !== $original && file_put_contents($path, $minified) !== false) {
+                $count++;
+                $bytes += strlen($original) - strlen($minified);
+            }
+        }
+
+        $io->write(
+            sprintf(
+                'Minified %d HTML file%s (saved %s).',
+                $count,
+                $count === 1 ? '' : 's',
+                number_format((float) $bytes)
+            )
+        );
     }
 
     /**
