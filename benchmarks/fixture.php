@@ -33,6 +33,19 @@ function sculpin_bench_fixture(string $target, int $count): void
         <<<YAML
             title: Sculpin Benchmark Site
             url: https://bench.example.com
+            menu:
+              - title: Home
+                url: /
+              - title: Blog
+                url: /blog
+              - title: Talks
+                url: /talks
+              - title: About
+                url: /about
+            social:
+              github: https://github.com/opdavies
+              mastodon: https://fosstodon.org/@opdavies
+              drupal: https://drupal.org/u/opdavies
             YAML,
     );
 
@@ -46,12 +59,45 @@ function sculpin_bench_fixture(string $target, int $count): void
                 <title>{% block title %}{{ page.title }} | {{ site.title }}{% endblock %}</title>
               </head>
               <body>
-                <header><a href="{{ site.url }}">{{ site.title }}</a></header>
+                <header>
+                  <a href="{{ site.url }}">{{ site.title }}</a>
+                  <nav>
+                    {% for item in site.menu %}
+                      <a href="{{ site.url }}{{ item.url }}">{{ item.title }}</a>
+                    {% endfor %}
+                  </nav>
+                </header>
                 <aside>{% include 'about-me.html.twig' %}</aside>
-                <main>{% block content %}{% endblock %}</main>
-                <footer>Sculpin Benchmark Site</footer>
+                <main>{% block body %}{% block content %}{% endblock %}{% endblock %}</main>
+                <footer>
+                  <ul>
+                    {% for network, url in site.social %}
+                      <li><a href="{{ url }}">{{ network }}</a></li>
+                    {% endfor %}
+                  </ul>
+                </footer>
               </body>
             </html>
+            TWIG,
+    );
+
+    // The post layout extends the base so every post page exercises
+    // the Twig template inheritance chain, and its front-matter
+    // condition ({% if page.featured %}) and the date filter.
+    file_put_contents(
+        $source . '/_layouts/post.html.twig',
+        <<<'TWIG'
+            {% extends 'default.html.twig' %}
+            {% block body %}
+              <article class="post">
+                {% if page.featured %}<p class="featured">Featured post</p>{% endif %}
+                <header class="byline">
+                  <h1>{{ page.title }}</h1>
+                  <time>{{ page.date|date('jS F Y') }}</time>
+                </header>
+                {% block content %}{% endblock %}
+              </article>
+            {% endblock %}
             TWIG,
     );
 
@@ -75,18 +121,25 @@ function sculpin_bench_fixture(string $target, int $count): void
             TWIG,
     );
 
+    // The index page loops the whole posts collection (the `use` front
+    // matter is what provides `data.posts`), extending the base
+    // template explicitly and marking the featured posts.
     file_put_contents(
         $source . '/index.html.twig',
         <<<'TWIG'
             ---
-            layout: default
             title: Home
+            use:
+              - posts
             ---
+            {% extends 'default.html.twig' %}
+            {% block content %}
             <ul>
             {% for post in data.posts %}
-              <li><a href="{{ post.url }}">{{ post.title }}</a></li>
+              <li><a href="{{ post.url }}">{{ post.title }}</a>{% if post.featured %} (featured){% endif %}</li>
             {% endfor %}
             </ul>
+            {% endblock %}
             TWIG,
     );
 
@@ -95,11 +148,16 @@ function sculpin_bench_fixture(string $target, int $count): void
         $month = (intdiv($i - 1, 100) % 12) + 1;
         $day = ($i % 28) + 1;
 
+        $frontMatter = "layout: post\n";
+
+        if ($i % 10 === 0) {
+            $frontMatter .= "featured: true\n";
+        }
+
         $body = <<<MD
             ---
             title: Benchmark Post {$n}
-            layout: default
-            ---
+            {$frontMatter}---
 
             ## Section one for post {$n}
 
