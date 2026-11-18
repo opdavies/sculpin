@@ -4,10 +4,11 @@ declare(strict_types=1);
 
 /*
  * Generates the deterministic Sculpin benchmark fixture: a site with
- * N markdown posts (default 400), a layout and an index page looping
- * the whole collection, with no dynamic dates, so every generation of
- * the same fixture produces byte-identical output -- which the
- * write-skipping and caching of the performance series rely on.
+ * N markdown posts (default 400), a layout with an "about me" partial
+ * included from it and an index page looping the whole collection,
+ * with no dynamic dates, so every generation of the same fixture
+ * produces byte-identical output -- which the write-skipping and
+ * caching of the performance series rely on.
  *
  * Standalone usage: php benchmarks/fixture.php <target-dir> [count]
  */
@@ -19,6 +20,7 @@ function sculpin_bench_fixture(string $target, int $count): void
     foreach ([
         $source . '/_posts',
         $source . '/_layouts',
+        $source . '/_partials',
         $target . '/app/config',
     ] as $directory) {
         if (!is_dir($directory) && !mkdir($directory, 0755, true)) {
@@ -45,10 +47,31 @@ function sculpin_bench_fixture(string $target, int $count): void
               </head>
               <body>
                 <header><a href="{{ site.url }}">{{ site.title }}</a></header>
+                <aside>{% include 'about-me.html.twig' %}</aside>
                 <main>{% block content %}{% endblock %}</main>
                 <footer>Sculpin Benchmark Site</footer>
               </body>
             </html>
+            TWIG,
+    );
+
+    // The "about me" block, included from the layout on every page so
+    // the benchmarks exercise the Twig include machinery too.
+    file_put_contents(
+        $source . '/_partials/about-me.html.twig',
+        <<<'TWIG'
+            <div class="about-me">
+              <h2>About me</h2>
+              <p>Oliver Davies is a PHP developer and architect specialising
+              in Drupal and Sculpin, building static sites and content
+              platforms. He writes about PHP, Nix and web architecture, and
+              maintains several open-source projects.</p>
+              <ul>
+                <li><a href="{{ site.url }}/blog">Read the blog</a></li>
+                <li><a href="{{ site.url }}/about">More about me</a></li>
+                <li><a href="{{ site.url }}/talks">Watch the talks</a></li>
+              </ul>
+            </div>
             TWIG,
     );
 
